@@ -1,101 +1,90 @@
-# create a class for matching prompt to book
 import pandas as pd
 import numpy as np
-from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from transformers import BertTokenizer, BertModel
+from transformers import pipeline, set_seed
+from transformers import AutoModel, AutoTokenizer
 import torch
+from sentence_transformers import SentenceTransformer
+import sys
+import os
+
+sys.path.append("../")
 
 
 class PromptMatching:
-    
+
     def __init__(self):
-      # apply the function to each element of the column using multiprocessing
-        self.df = pd.read_csv('data/products.csv')
+        self.df = os.environ.get("DATA_PATH")
+        #self.df = pd.read_csv('/Users/iqraimtiaz/Documents/duke/Courses/ind-study/E-commerce-Product-Reccommendation/data/products.csv')
+        self.generator = pipeline('text-generation', model='EleutherAI/gpt-neo-125M', device='cpu')
+        self.tokenizer = AutoTokenizer.from_pretrained('gpt2')
+        self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        self.model = AutoModel.from_pretrained('gpt2')
+        self.bert_model = SentenceTransformer('bert-base-nli-mean-tokens')
 
-    def keyword_matching(self,prompt):
-        # Prompt and relevant keywords
-        vectorizer = CountVectorizer()
-        keywords = vectorizer.fit_transform([prompt]).toarray()[0]
+        set_seed(42)
+        self.df.fillna('', inplace=True)
+        self.df['Details'] = self.df['Name'] + ' ' + self.df['Short description'] + ' ' + self.df['Description']
+        self.df['Image_URL'] = self.df['Images'].apply(lambda x: x.split(',')[0])
 
-        # Loop through each book summary
-        keywords_match = []
-        for summary in self.df['Summary']:
-            if isinstance(summary, str):
-                # Check if summary contains all relevant keywords
-                book_keywords = vectorizer.transform([summary]).toarray()[0]
-                match = all(book_keywords[i] >= keywords[i] for i in range(len(keywords)))
-            else:
-                # If summary is NaN, set match to False
-                match = False
-            keywords_match.append(match)
-
-        # Add keywords_match column to self.df dataframe
-        self.df['keywords_match'] = keywords_match
-        return self.df
-        
-    def cosine_similarity(self,prompt):
+    def cosine_similarity(self, prompt):
         vectorizer = TfidfVectorizer()
         prompt_vector = vectorizer.fit_transform([prompt])
 
-        for col in ['Name', 'Short description', 'Description']:
-            cosine_similarity_scores = []
-            for desc in self.df[col]:
-                if isinstance(desc, str):
-                    desc_vector = vectorizer.transform([desc])
-                    similarity = cosine_similarity(prompt_vector, desc_vector)[0][0]
-                else:
-                    # If summary is NaN, set similarity score to NaN
-                    similarity = np.nan
-                cosine_similarity_scores.append(similarity)
-
-            self.df['cs'+col] = cosine_similarity_scores
+        product_vectors = vectorizer.transform(self.df['Details'])
+        similarity_scores = cosine_similarity(prompt_vector, product_vectors).flatten()
+        self.df['tf-idfDetails'] = np.round(similarity_scores, 2)
         return self.df
-        
-    def bert_matching(self,prompt):
-        model_name = 'bert-base-uncased'
-        tokenizer = BertTokenizer.from_pretrained(model_name)
-        model = BertModel.from_pretrained(model_name)
 
-        book_summaries = self.df['Summary'].tolist()
-        book_ids = self.df.index.tolist()
-
-        book_embeddings = []
-        for summary in book_summaries:
-            summary_tokens = tokenizer(summary, truncation=True, padding='max_length', max_length=512, return_tensors='pt')
-            with torch.no_grad():
-                summary_embedding = model(summary_tokens['input_ids'], summary_tokens['attention_mask'])[0][:, 0, :]
-                book_embeddings.append(summary_embedding)
-
-        book_embeddings = torch.cat(book_embeddings, dim=0)
-        book_embeddings = book_embeddings.reshape(len(book_summaries), -1)
-        print(book_embeddings)
-        prompt_tokens = tokenizer(prompt, truncation=True, padding='max_length', max_length=512, return_tensors='pt')
-
+    def encode(self, input_text, model, tokenizer):
+        if not input_text.strip():
+            return np.zeros((1, model.config.hidden_size))
+        tokens = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True)
         with torch.no_grad():
-            prompt_embedding = model(prompt_tokens['input_ids'], prompt_tokens['attention_mask'])[0][:, 0, :]
+            embeddings = model(**tokens).last_hidden_state
+        return embeddings.mean(dim=1).numpy()
 
-        similarities = cosine_similarity(prompt_embedding.reshape(1, -1), book_embeddings).squeeze().tolist()
-        self.df['bert_cosine_similarity'] = similarities
-        #ranked_self.df = sorted(zip(book_ids, similarities), key=lambda x: x[1], reverse=True)
 
-        #return ranked_self.df
-        
-        
-    def get_matched_prompt_results(self,prompt,col):
-        self.cosine_similarity(prompt,self.df,col)
-        matched = self.df.sort_values(by='cosine_similarity', ascending=False)
-        return matched.head(1)['cosine_similarity'].values[0]
-        
-# create main for this class
+    def compute_similarity(self, search_prompt, model, tokenizer, result_col_name):
+        product_descriptions = self.df['Details']
+        encoded_product_descriptions = [self.encode(desc, model, tokenizer) for desc in product_descriptions]
+        encoded_search_prompt = self.encode(search_prompt, model, tokenizer)
+
+        # Normalize the embeddings
+        encoded_product_descriptions = [emb / np.linalg.norm(emb) for emb in encoded_product_descriptions]
+        encoded_search_prompt = encoded_search_prompt / np.linalg.norm(encoded_search_prompt)
+
+        # Reshape the tensors to have compatible dimensions for inner product
+        encoded_product_descriptions = np.array(encoded_product_descriptions).reshape(len(product_descriptions), -1)
+        encoded_search_prompt = np.array(encoded_search_prompt).reshape(-1)
+
+        # Compute the similarity scores
+        similarity_scores = np.inner(encoded_product_descriptions, encoded_search_prompt)
+        similarity_scores = np.round(similarity_scores, 2)
+
+        self.df[result_col_name] = similarity_scores
+        return self.df
+
+
+    def gpt3_similarity(self, search_prompt):
+        return self.compute_similarity(search_prompt, self.model, self.tokenizer, "gpt3Details")
+
+    def bert_similarity(self, search_prompt):
+        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        model = AutoModel.from_pretrained("bert-base-uncased")
+        return self.compute_similarity(search_prompt, model, tokenizer, "bertDetails")
+
+
+    def sentence_transformer(self, search_prompt):
+        model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+        product_descriptions = self.df['Details']
+        encoded_product_descriptions = model.encode(product_descriptions)
+        encoded_search_prompt = model.encode(search_prompt)
+        similarity_scores = np.inner(encoded_product_descriptions, encoded_search_prompt)
+        similarity_scores = np.round(similarity_scores, 2)
+        self.df['transformersDetails'] = similarity_scores
+        return self.df
 
 if __name__ == "__main__":
-    # initialize this class
     prompt_matching = PromptMatching()
-    
-    prompt = "Looking for a book that explores the changing role of religion in the 20th century. Specifically, how certain religious groups redefined what it meant to be religious and allowed their members the choice of what kind of God to believe in, or the option to not believe in God at all."
-    
-        
-
-
